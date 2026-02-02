@@ -4,7 +4,24 @@ import torch
 import torch.nn.functional as F
 import math
 import my_functionaladj as mf
-from torch.cuda.amp import autocast
+from contextlib import nullcontext
+
+# AMP autocast helper (兼容旧版 torch，且在无 CUDA/bf16 不可用时关闭)
+USE_AMP = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+if torch.cuda.is_available():
+    try:
+        from torch import amp
+
+        def _AUTOCAST(enabled: bool):
+            return amp.autocast("cuda", dtype=torch.bfloat16, enabled=enabled and USE_AMP)
+    except Exception:
+        from torch.cuda.amp import autocast as _legacy_autocast
+
+        def _AUTOCAST(enabled: bool):
+            return _legacy_autocast(dtype=torch.bfloat16, enabled=enabled and USE_AMP)
+else:
+    def _AUTOCAST(enabled: bool):
+        return nullcontext()
 
 # GPU device configuration
 DEVICE_ = ['cuda' if torch.cuda.is_available() else 'cpu']
@@ -164,7 +181,7 @@ class ParallelFilterLearningSystem:
         
         # ============ Key optimization: single-sample update ============
         # Use AMP autocast for matmul/conv; weights remain float32
-        with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=USE_AMP):
+        with _AUTOCAST(enabled=True):
             # Create filter-dependent matrix
             stride = conv_layer.stride if isinstance(conv_layer.stride, int) else conv_layer.stride[0]
             pad = conv_layer.padding if isinstance(conv_layer.padding, int) else conv_layer.padding[0]
@@ -219,6 +236,12 @@ class ParallelFilterLearningSystem:
             # Convolution layer error
             e_conv_flat = dot_value * e_conv_out
             e_conv = e_conv_flat.reshape(conv_out_shape)
+        
+        # Cast to float32 for stability and dtype consistency in updates
+        error = error.float()
+        fc_in = fc_in.float()
+        in_matrix = in_matrix.float()
+        e_conv = e_conv.float()
         
         # ============ Auto-adjust learning rate to ensure convergence ============
         if auto:
