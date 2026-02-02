@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+
+# Logs
+*.log
+
+# Data & experiment outputs
+data/
+saved_models*/
+runs/
+
+# Model weights / checkpoints
+*.pt
+*.pth
+*.pkl
+
+# Virtual env (如果你有的话)
+.venv/
