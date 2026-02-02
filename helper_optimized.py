@@ -4,10 +4,12 @@ import torch
 import torch.nn.functional as F
 import math
 import my_functionaladj as mf
+from torch.cuda.amp import autocast
 
 # GPU device configuration
 DEVICE_ = ['cuda' if torch.cuda.is_available() else 'cpu']
 print("→ Optimized helper running on", DEVICE_[0])
+USE_AMP = torch.cuda.is_available()
 
 
 def one_hot_embedding(labels, num_classes):
@@ -161,60 +163,62 @@ class ParallelFilterLearningSystem:
         alpha_w = torch.tensor(1.0, device=DEVICE)
         
         # ============ Key optimization: single-sample update ============
-        # Create filter-dependent matrix
-        stride = conv_layer.stride if isinstance(conv_layer.stride, int) else conv_layer.stride[0]
-        pad = conv_layer.padding if isinstance(conv_layer.padding, int) else conv_layer.padding[0]
-        
-        # Pass the weight shape (not the tensor) so unfold receives int kernel sizes
-        in_matrix = create_matrix_x_batch(layer_in, fil.shape, stride, pad)[0]  # [C*K*K, H*W]
-        
-        # Convolution forward pass
-        conv_act = torch.matmul(fil_w, in_matrix)  # [num_filters, num_positions]
-        conv_out = conv_layer.activations(conv_act)
-        conv_out_shape = conv_out.shape
-        
-        # Reshape to 4D for pooling
-        spatial_dim = int(math.sqrt(conv_out.shape[1]))
-        conv_out_4d = conv_out.reshape(1, conv_out.shape[0], spatial_dim, spatial_dim)
-        
-        # Pooling
-        if pool_layer:
-            if pool_layer == 'avg':
-                pool_out = F.avg_pool2d(conv_out_4d, ker, stri)
-                pool_ind = None
-            elif pool_layer == 'max':
-                pool_out, pool_ind = F.max_pool2d(conv_out_4d, ker, stri, return_indices=True)
-            fc_in = pool_out.reshape(-1, 1)
-        else:
-            fc_in = conv_out.reshape(-1, 1)
-        
-        # FC forward pass
-        y_pred = fc_layer.activations(torch.matmul(fc_w, fc_in))
-        
-        # Compute error
-        error = y_target[0] - y_pred
-        
-        # FC backprop
-        e_fc_in = torch.matmul(fc_w.t(), error)
-        
-        # Pooling backprop
-        if pool_layer:
-            e_pool_out = e_fc_in.reshape(pool_out.shape)
-            if pool_layer == 'avg':
-                e_conv_out = pool_backward_error_batch(e_pool_out, ker)
-            elif pool_layer == 'max':
-                e_conv_out = F.max_unpool2d(e_pool_out, pool_ind, ker)
-            e_conv_out = e_conv_out.reshape(-1, 1)
-        else:
-            e_conv_out = e_fc_in.reshape(-1, 1)
-        
-        # Derivative of activation function
-        dot_value = mf.derivative_fun(conv_layer.activations)(conv_act.flatten(), slope)
-        dot_value = dot_value.reshape(-1, 1)
-        
-        # Convolution layer error
-        e_conv_flat = dot_value * e_conv_out
-        e_conv = e_conv_flat.reshape(conv_out_shape)
+        # Use AMP autocast for matmul/conv; weights remain float32
+        with autocast(device_type='cuda', dtype=torch.bfloat16, enabled=USE_AMP):
+            # Create filter-dependent matrix
+            stride = conv_layer.stride if isinstance(conv_layer.stride, int) else conv_layer.stride[0]
+            pad = conv_layer.padding if isinstance(conv_layer.padding, int) else conv_layer.padding[0]
+            
+            # Pass the weight shape (not the tensor) so unfold receives int kernel sizes
+            in_matrix = create_matrix_x_batch(layer_in, fil.shape, stride, pad)[0]  # [C*K*K, H*W]
+            
+            # Convolution forward pass
+            conv_act = torch.matmul(fil_w, in_matrix)  # [num_filters, num_positions]
+            conv_out = conv_layer.activations(conv_act)
+            conv_out_shape = conv_out.shape
+            
+            # Reshape to 4D for pooling
+            spatial_dim = int(math.sqrt(conv_out.shape[1]))
+            conv_out_4d = conv_out.reshape(1, conv_out.shape[0], spatial_dim, spatial_dim)
+            
+            # Pooling
+            if pool_layer:
+                if pool_layer == 'avg':
+                    pool_out = F.avg_pool2d(conv_out_4d, ker, stri)
+                    pool_ind = None
+                elif pool_layer == 'max':
+                    pool_out, pool_ind = F.max_pool2d(conv_out_4d, ker, stri, return_indices=True)
+                fc_in = pool_out.reshape(-1, 1)
+            else:
+                fc_in = conv_out.reshape(-1, 1)
+            
+            # FC forward pass
+            y_pred = fc_layer.activations(torch.matmul(fc_w, fc_in))
+            
+            # Compute error
+            error = y_target[0] - y_pred
+            
+            # FC backprop
+            e_fc_in = torch.matmul(fc_w.t(), error)
+            
+            # Pooling backprop
+            if pool_layer:
+                e_pool_out = e_fc_in.reshape(pool_out.shape)
+                if pool_layer == 'avg':
+                    e_conv_out = pool_backward_error_batch(e_pool_out, ker)
+                elif pool_layer == 'max':
+                    e_conv_out = F.max_unpool2d(e_pool_out, pool_ind, ker)
+                e_conv_out = e_conv_out.reshape(-1, 1)
+            else:
+                e_conv_out = e_fc_in.reshape(-1, 1)
+            
+            # Derivative of activation function
+            dot_value = mf.derivative_fun(conv_layer.activations)(conv_act.flatten(), slope)
+            dot_value = dot_value.reshape(-1, 1)
+            
+            # Convolution layer error
+            e_conv_flat = dot_value * e_conv_out
+            e_conv = e_conv_flat.reshape(conv_out_shape)
         
         # ============ Auto-adjust learning rate to ensure convergence ============
         if auto:
@@ -247,6 +251,10 @@ class ParallelFilterLearningSystem:
         # ============ Weight updates ============
         fc_w_new = fc_w + alpha_w * gain * torch.matmul(error, fc_in.t())
         fil_w_new = fil_w + alpha_v * gain * torch.matmul(e_conv, in_matrix.t())
+        
+        # Cast updates back to float32 for stability
+        fc_w_new = fc_w_new.float()
+        fil_w_new = fil_w_new.float()
         
         # Reshape back to original shape
         fil_w_new = fil_w_new.reshape(fil_shape)

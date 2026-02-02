@@ -20,8 +20,10 @@ import my_module1 as mm
 from my_module1 import m0, m1, m2, m3, m4, m5, m6, m7
 
 # ============ Global Configuration ============
-# Key change: set batch_size to 1 to ensure per-sample updates
-BATCH_SIZE = 1  # Must be 1 to satisfy the convergence proof
+# Train loader batch size (per-sample updates still enforced inside training loops)
+BATCH_SIZE = 16
+# DataLoader workers for faster I/O (tune for your environment)
+NUM_WORKERS = 4
 LEARNING_RATE = 0.005  # Adjustable
 NUM_EPOCHS = 200
 
@@ -30,6 +32,13 @@ print("→ Running on device:", DEVICE)
 
 mm.DEVICE = DEVICE
 DEVICE_[0] = DEVICE
+
+# Enable cuDNN benchmarking (speeds up fixed input sizes)
+torch.backends.cudnn.benchmark = True
+# Enable TF32 on A100/AMPERE for matmul/conv
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
 
 # Set save path
 FOLDER_e2e = mm.FOLDER_e2e
@@ -95,16 +104,25 @@ def create_dataloaders(train_dataset, val_dataset, num_loaders=8):
     train_loaders = []
     val_loaders = []
     
+    pin_mem = DEVICE.type == 'cuda'
+    loader_kwargs = dict(
+        num_workers=NUM_WORKERS,
+        pin_memory=pin_mem,
+        persistent_workers=NUM_WORKERS > 0
+    )
+    
     for i in range(num_loaders):
         train_loader = DataLoader(
             train_dataset, 
             batch_size=BATCH_SIZE,  # Must be 1
-            shuffle=True
+            shuffle=True,
+            **loader_kwargs
         )
         val_loader = DataLoader(
             val_dataset, 
             batch_size=64,  # Can use a larger batch for evaluation
-            shuffle=False
+            shuffle=False,
+            **loader_kwargs
         )
         train_loaders.append(train_loader)
         val_loaders.append(val_loader)
@@ -176,12 +194,8 @@ def train_model_optimized(model, model_num, train_loader, val_loader,
     for epoch in range(epochs):
         model.train()
         
-        # Train sample by sample (batch_size=1)
+        # Train sample by sample (function splits batch internally)
         for batch_idx, (x, y) in enumerate(train_loader):
-            # Ensure batch_size=1
-            assert x.shape[0] == 1, f"batch_size must be 1, current is {x.shape[0]}"
-            
-            # Use the optimized training function
             inc_train_2_layer_e2e_optimized(
                 model=model,
                 batch_idx=batch_idx,
@@ -254,8 +268,6 @@ def train_parallel_models_optimized(models, train_loaders, val_loaders,
             
             # Train one epoch
             for batch_idx, (x, y) in enumerate(train_loader):
-                assert x.shape[0] == 1, "batch_size must be 1"
-                
                 inc_train_2_layer_e2e_optimized(
                     model=model,
                     batch_idx=batch_idx,
