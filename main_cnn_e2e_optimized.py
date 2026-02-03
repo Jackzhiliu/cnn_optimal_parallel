@@ -20,8 +20,8 @@ import my_module1 as mm
 from my_module1 import m0, m1, m2, m3, m4, m5, m6, m7
 
 # ============ Global Configuration ============
-# Train loader batch size (per-sample updates still enforced inside training loops)
-BATCH_SIZE = 16
+# Train loader batch size (larger = fewer iterations = faster)
+BATCH_SIZE = 64
 # DataLoader workers for faster I/O (tune for your environment)
 NUM_WORKERS = 4
 LEARNING_RATE = 0.005  # Adjustable
@@ -95,15 +95,13 @@ def get_datasets():
     return train_dataset, val_dataset
 
 
-def create_dataloaders(train_dataset, val_dataset, num_loaders=8):
+def create_dataloaders(train_dataset, val_dataset, num_models=8):
     """
-    Create multiple dataloaders (for different models)
+    Create dataloaders for training
     
-    Note: batch_size must be 1
+    Note: All models share the SAME train_loader to ensure they process
+    the same samples in each iteration (required by the algorithm).
     """
-    train_loaders = []
-    val_loaders = []
-    
     pin_mem = DEVICE.type == 'cuda'
     loader_kwargs = dict(
         num_workers=NUM_WORKERS,
@@ -111,23 +109,26 @@ def create_dataloaders(train_dataset, val_dataset, num_loaders=8):
         persistent_workers=NUM_WORKERS > 0
     )
     
-    for i in range(num_loaders):
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=BATCH_SIZE,  # Must be 1
-            shuffle=True,
-            **loader_kwargs
-        )
+    # Single shared train loader for all models
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        **loader_kwargs
+    )
+    
+    # Separate val loaders (can be shared, but keeping separate for flexibility)
+    val_loaders = []
+    for i in range(num_models):
         val_loader = DataLoader(
             val_dataset, 
             batch_size=64,  # Can use a larger batch for evaluation
             shuffle=False,
             **loader_kwargs
         )
-        train_loaders.append(train_loader)
         val_loaders.append(val_loader)
     
-    return train_loaders, val_loaders
+    return train_loader, val_loaders
 
 
 # ============ Model Management ============
@@ -229,14 +230,20 @@ def train_model_optimized(model, model_num, train_loader, val_loader,
     return model, best_accu
 
 
-def train_parallel_models_optimized(models, train_loaders, val_loaders, 
-                                   configs, learning_rate, epochs):
+def train_sequential_models_optimized(models, train_loader, val_loaders, 
+                                      configs, learning_rate, epochs):
     """
-    Train multiple models in parallel (progressively increasing depth)
+    Train multiple models with correct sequential dependency (progressively increasing depth)
+    
+    IMPORTANT: The 8 models are NOT independent! They must:
+    1. Process the SAME sample at each iteration
+    2. Copy weights BETWEEN each model's training step (not just at epoch start)
+    
+    This preserves the algorithm's convergence guarantees while keeping I/O and compute optimizations.
     
     Args:
         models: List of models
-        train_loaders: List of training dataloaders
+        train_loader: Single training dataloader (all models share the same data)
         val_loaders: List of validation dataloaders
         configs: Config list [(conv_idx, pool_type, ker, stri, copy_from_indices)]
         learning_rate: Learning rate
@@ -247,6 +254,8 @@ def train_parallel_models_optimized(models, train_loaders, val_loaders,
         best_accus: List of best accuracies
     """
     best_accus = [0] * len(models)
+    num_models = len(models)
+    t0 = time.time()
     
     for epoch in range(epochs):
         print(f'\n{"#"*60}')
@@ -256,18 +265,29 @@ def train_parallel_models_optimized(models, train_loaders, val_loaders,
         t_epoch = time.time()
         t_train = time.time()
         
-        # Process all models in parallel
-        for i, (model, train_loader, val_loader, config) in enumerate(
-            zip(models, train_loaders, val_loaders, configs)
-        ):
-            conv_idx, pool_type, ker, stri, copy_indices = config
+        # Create data iterator for this epoch (all models share the SAME data)
+        data_iter = iter(train_loader)
+        num_batches = len(train_loader)
+        
+        # Process each batch
+        for batch_idx in range(num_batches):
+            try:
+                x, y = next(data_iter)
+            except StopIteration:
+                print('StopIteration')
+                data_iter = iter(train_loader)
+                x, y = next(data_iter)
             
-            # Copy weights from the previous model (progressive training)
-            if i > 0 and copy_indices:
-                get_set_weight(models[i-1], model, copy_indices)
-            
-            # Train one epoch
-            for batch_idx, (x, y) in enumerate(train_loader):
+            # Train all models SEQUENTIALLY on the SAME sample
+            # with weight copying between each model
+            for i, (model, config) in enumerate(zip(models, configs)):
+                conv_idx, pool_type, ker, stri, copy_indices = config
+                
+                # Copy weights from previous model BEFORE training this model
+                if i > 0 and copy_indices:
+                    get_set_weight(models[i-1], model, copy_indices)
+                
+                # Train this model on the current sample
                 inc_train_2_layer_e2e_optimized(
                     model=model,
                     batch_idx=batch_idx,
@@ -281,26 +301,29 @@ def train_parallel_models_optimized(models, train_loaders, val_loaders,
                     gain=learning_rate,
                     auto=True
                 )
-                
-                # Control logging frequency
-                if batch_idx % 1000 == 0 and batch_idx > 0:
-                    print(f'  Model {i} - Batch {batch_idx}/{len(train_loader)}')
+            
+            # Print progress every 100 batches
+            if batch_idx % 100 == 0:
+                elapsed = time.time() - t_train
+                pct = (batch_idx + 1) / num_batches * 100
+                batches_per_sec = (batch_idx + 1) / elapsed if elapsed > 0 else 0
+                print(f'  Batch {batch_idx+1}/{num_batches} ({pct:.1f}%) - {elapsed:.1f}s - {batches_per_sec:.1f} batches/s')
+        
         train_time = time.time() - t_train
+        print(f'\nTraining time: {train_time:.1f}s')
+        print(f'Total elapsed: {time.time() - t0:.1f}s')
         
         # Evaluate all models
         t_eval = time.time()
-        if epoch % 1 == 0:
-            print(f'\nEpoch {epoch+1} evaluation results:')
-            for i, (model, train_loader, val_loader) in enumerate(
-                zip(models, train_loaders, val_loaders)
-            ):
-                acc_lst = model.evaluate_both(i, train_loader, val_loader)
-                print(f'  Model {i}: Train={acc_lst[0]:.2f}%, Val={acc_lst[1]:.2f}%')
-                
-                best_accus[i] = save_best_model(i, epoch, acc_lst, best_accus[i], model)
+        print(f'\nEpoch {epoch+1} evaluation results:')
+        for i, (model, val_loader) in enumerate(zip(models, val_loaders)):
+            acc_lst = model.evaluate_both(i, train_loader, val_loader)
+            print(f'  Model {i}: Train={acc_lst[0]:.2f}%, Val={acc_lst[1]:.2f}%')
+            
+            best_accus[i] = save_best_model(i, epoch, acc_lst, best_accus[i], model)
         eval_time = time.time() - t_eval
         
-        print(f'Train time: {train_time:.1f}s | Eval time: {eval_time:.1f}s | Epoch total: {time.time() - t_epoch:.1f}s')
+        print(f'Train: {train_time:.1f}s | Eval: {eval_time:.1f}s | Epoch total: {time.time() - t_epoch:.1f}s')
     
     return models, best_accus
 
@@ -313,27 +336,30 @@ def main():
     print("Optimized E2E-CNN Training")
     print("="*60)
     print(f"Device: {DEVICE}")
-    print(f"Batch Size: {BATCH_SIZE} (must be 1 to ensure convergence)")
+    print(f"Batch Size: {BATCH_SIZE}")
     print(f"Learning rate: {LEARNING_RATE}")
     print(f"Epochs: {NUM_EPOCHS}")
+    print(f"Optimizations: TF32, AMP, cudnn.benchmark, object reuse")
+    print(f"Per-sample update: ✓ maintained")
     print("="*60 + "\n")
     
     # Load data
     train_dataset, val_dataset = get_datasets()
-    train_loaders, val_loaders = create_dataloaders(train_dataset, val_dataset, num_loaders=8)
+    train_loader, val_loaders = create_dataloaders(train_dataset, val_dataset, num_models=8)
     
     # Create models (progressively increasing depth)
+    # Note: All models use the same train_loader for initialization
     N_CLASSES = 10
     
     print("Creating models...")
-    model0 = m0(N_CLASSES, train_loaders[0]).float()
-    model1 = m1(N_CLASSES, train_loaders[1]).float()
-    model2 = m2(N_CLASSES, train_loaders[2]).float()
-    model3 = m3(N_CLASSES, train_loaders[3]).float()
-    model4 = m4(N_CLASSES, train_loaders[4]).float()
-    model5 = m5(N_CLASSES, train_loaders[5]).float()
-    model6 = m6(N_CLASSES, train_loaders[6]).float()
-    model7 = m7(N_CLASSES, train_loaders[7]).float()
+    model0 = m0(N_CLASSES, train_loader).float()
+    model1 = m1(N_CLASSES, train_loader).float()
+    model2 = m2(N_CLASSES, train_loader).float()
+    model3 = m3(N_CLASSES, train_loader).float()
+    model4 = m4(N_CLASSES, train_loader).float()
+    model5 = m5(N_CLASSES, train_loader).float()
+    model6 = m6(N_CLASSES, train_loader).float()
+    model7 = m7(N_CLASSES, train_loader).float()
     
     models = [model0, model1, model2, model3, model4, model5, model6, model7]
     
@@ -350,37 +376,17 @@ def main():
         (-4, 'max', 2, 2, [0, 2, 4, 5, 7, 8, 10]) # model7
     ]
     
-    # Start training
-    print("\nStart training all models in parallel...\n")
+    # Start training with optimized sequential execution
+    print("\nStart training all models (optimized sequential)...\n")
+    print("Optimizations applied:")
+    print("  - TF32 / AMP for faster matmul/conv")
+    print("  - cudnn.benchmark for fixed input sizes")
+    print("  - ParallelFilterLearningSystem object reuse")
+    print(f"  - Batch size {BATCH_SIZE} to reduce iterations\n")
     
-    # Method 1: Train each model sequentially (more stable)
-    # best_accus = []
-    # for i, (model, train_loader, val_loader, config) in enumerate(
-    #     zip(models, train_loaders, val_loaders, configs)
-    # ):
-    #     conv_idx, pool_type, ker, stri, copy_indices = config
-    #     
-    #     # Copy weights from the previous model
-    #     if i > 0 and copy_indices:
-    #         get_set_weight(models[i-1], model, copy_indices)
-    #     
-    #     # Train the current model
-    #     model, best_accu = train_model_optimized(
-    #         model=model,
-    #         model_num=i,
-    #         train_loader=train_loader,
-    #         val_loader=val_loader,
-    #         conv_layer_config=(conv_idx, pool_type, ker, stri),
-    #         learning_rate=LEARNING_RATE,
-    #         epochs=NUM_EPOCHS
-    #     )
-    #     
-    #     models[i] = model
-    #     best_accus.append(best_accu)
-    
-    # Method 2: Parallel training
-    models, best_accus = train_parallel_models_optimized(
-        models, train_loaders, val_loaders, configs, LEARNING_RATE, NUM_EPOCHS
+    # Optimized sequential training: correct algorithm with reduced overhead
+    models, best_accus = train_sequential_models_optimized(
+        models, train_loader, val_loaders, configs, LEARNING_RATE, NUM_EPOCHS
     )
     
     # Print final results

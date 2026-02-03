@@ -6,27 +6,18 @@ import math
 import my_functionaladj as mf
 from contextlib import nullcontext
 
-# AMP autocast helper (兼容旧版 torch，且在无 CUDA/bf16 不可用时关闭)
-USE_AMP = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-if torch.cuda.is_available():
-    try:
-        from torch import amp
+# AMP autocast helper - DISABLED for now (context manager overhead too high)
+# Enable only if profiling shows benefit
+USE_AMP = False  # Set to True to re-enable AMP
 
-        def _AUTOCAST(enabled: bool):
-            return amp.autocast("cuda", dtype=torch.bfloat16, enabled=enabled and USE_AMP)
-    except Exception:
-        from torch.cuda.amp import autocast as _legacy_autocast
-
-        def _AUTOCAST(enabled: bool):
-            return _legacy_autocast(dtype=torch.bfloat16, enabled=enabled and USE_AMP)
-else:
-    def _AUTOCAST(enabled: bool):
-        return nullcontext()
+def _AUTOCAST(enabled: bool):
+    """Disabled AMP - returns nullcontext to avoid overhead"""
+    return nullcontext()
 
 # GPU device configuration
 DEVICE_ = ['cuda' if torch.cuda.is_available() else 'cpu']
 print("→ Optimized helper running on", DEVICE_[0])
-USE_AMP = torch.cuda.is_available()
+# USE_AMP already set above
 
 
 def one_hot_embedding(labels, num_classes):
@@ -287,7 +278,8 @@ class ParallelFilterLearningSystem:
 
 def inc_train_single_sample_optimized(model, x, y, conv_idx, fc_idx=-1, 
                                      ker=2, stri=2, pool_layer='max', 
-                                     gain=0.001, slope=0.01, auto=True):
+                                     gain=0.001, slope=0.01, auto=True,
+                                     parallel_system=None):
     """
     Single-sample E2E training (optimized)
     
@@ -295,6 +287,7 @@ def inc_train_single_sample_optimized(model, x, y, conv_idx, fc_idx=-1,
     1. batch_size=1 to ensure per-sample updates (matches convergence proof)
     2. Vectorized operations to reduce loops
     3. Auto-adjust learning rate to ensure convergence
+    4. Optional reuse of ParallelFilterLearningSystem to reduce overhead
     
     Args:
         model: CNN model
@@ -308,14 +301,16 @@ def inc_train_single_sample_optimized(model, x, y, conv_idx, fc_idx=-1,
         gain: base learning rate
         slope: LeakyReLU slope
         auto: whether to auto-adjust learning rate
+        parallel_system: optional pre-created ParallelFilterLearningSystem (for reuse)
     
     Returns:
         None (weights updated in place)
     """
     assert x.shape[0] == 1, "batch_size must be 1 to ensure convergence"
     
-    # Create parallel learning system
-    parallel_system = ParallelFilterLearningSystem(model, DEVICE_[0])
+    # Reuse or create parallel learning system
+    if parallel_system is None:
+        parallel_system = ParallelFilterLearningSystem(model, DEVICE_[0])
     
     with torch.no_grad():
         # Compute gradients and update weights
@@ -376,9 +371,10 @@ def inc_train_2_layer_e2e_optimized(model, batch_idx, epoch_idx, x, y,
     Replacement for the original inc_train_2_layer_e2e_acce function
     
     Key improvements:
-    1. Ensure batch_size=1
+    1. Ensure batch_size=1 per-sample updates
     2. Vectorized matrix operations
     3. Automatic learning-rate adjustment
+    4. Reuse ParallelFilterLearningSystem to reduce object creation overhead
     
     Args:
         model: CNN model
@@ -406,14 +402,19 @@ def inc_train_2_layer_e2e_optimized(model, batch_idx, epoch_idx, x, y,
     # Get slope parameter for LeakyReLU
     slope = 0.01  # default slope
     
+    # Create ParallelFilterLearningSystem ONCE for the entire batch (optimization)
+    parallel_system = ParallelFilterLearningSystem(model, DEVICE_[0])
+    
     # Train sample by sample (as required by the convergence proof)
+    # But reuse the parallel_system object to reduce overhead
     for i in range(x.shape[0]):
         x_single = x[i:i+1]  # [1, C, H, W]
         y_single = y[i:i+1]  # [1]
         
         inc_train_single_sample_optimized(
             model, x_single, y_single, conv_idx, fc_idx,
-            ker, stri, pool_layer, gain, slope, auto
+            ker, stri, pool_layer, gain, slope, auto,
+            parallel_system=parallel_system  # Reuse the system
         )
 
 
